@@ -63,7 +63,7 @@ Two things in this contract are explicitly unverified and flagged in the source.
 
 ## Tests
 
-Direct mode, with web and LLM mocked.
+Direct mode.
 
 ```bash
 pytest tests/direct/test_bounty_vault.py -v
