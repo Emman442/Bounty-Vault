@@ -9,16 +9,14 @@ MIN_DEADLINE_MINUTES = 60
 MAX_DEADLINE_MINUTES = 129600
 MAX_PAGE_CHARS = 4000
 
-MERGE_MARKERS = (
-    "successfully merged",
-    "pull request was merged",
-    "this pull request is merged",
-    "state: merged",
-    "status: merged",
-)
-
 PAYOUT_LINE_RE = re.compile(
     r"(?im)^\s*bounty\s*payout\s*:\s*(0x[a-fA-F0-9]{40})\s*$"
+)
+ISSUE_RE = re.compile(
+    r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)$"
+)
+PR_RE = re.compile(
+    r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)$"
 )
 
 
@@ -95,43 +93,99 @@ def _epoch(ts: str) -> int:
         _fail("timestamp format not recognised: " + s[:40])
 
 
+def _parse_issue(url: str):
+    match = ISSUE_RE.match(url.strip())
+    if not match:
+        _fail("issue_url must be https://github.com/owner/repo/issues/123")
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _parse_pr(url: str):
+    match = PR_RE.match(url.strip())
+    if not match:
+        _fail("pr_url must be https://github.com/owner/repo/pull/456")
+    return match.group(1), match.group(2), match.group(3)
+
+
 def _fetch(url: str):
     try:
         response = gl.nondet.web.get(url)
         text = response.body.decode("utf-8", errors="ignore").strip()
     except Exception:
-        try:
-            text = str(gl.nondet.web.render(url, mode="text")).strip()
-        except Exception:
-            return None
+        return None
     if len(text) < 20:
         return None
     return text[:MAX_PAGE_CHARS]
 
 
-def _judge(issue_url: str, pr_url: str) -> str:
+def _api_json(url: str):
+    text = _fetch(url)
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _binds_issue(pr: dict, owner: str, repo: str, issue_number: str) -> bool:
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    base_repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+    full_name = str(base_repo.get("full_name", "")).lower()
+    if full_name != (owner + "/" + repo).lower():
+        return False
+    body = str(pr.get("body") or "")
+    issue_url = "https://github.com/" + owner + "/" + repo + "/issues/" + issue_number
+    if issue_url.lower() in body.lower():
+        return True
+    return re.search(r"(?i)(?:fix(?:es|ed)?|close(?:s|d)?|resolve(?:s|d)?)\s+#%s\b" % issue_number, body) is not None
+
+
+def _judge(owner: str, repo: str, issue_number: str, pr_number: str) -> str:
     def leader() -> str:
-        pr_text = _fetch(pr_url)
-        if pr_text is None:
-            return json.dumps({"payout_address": "", "verdict": "VOID"}, separators=(",", ":"))
-        lowered = pr_text.lower()
-        if not any(marker in lowered for marker in MERGE_MARKERS):
+        empty = json.dumps({"payout_address": "", "verdict": "VOID"}, separators=(",", ":"))
+        issue = _api_json(
+            "https://api.github.com/repos/" + owner + "/" + repo + "/issues/" + issue_number
+        )
+        pr = _api_json(
+            "https://api.github.com/repos/" + owner + "/" + repo + "/pulls/" + pr_number
+        )
+        if issue is None or pr is None:
+            return empty
+        if str(issue.get("number", "")) != issue_number or str(pr.get("number", "")) != pr_number:
+            return empty
+        if not _binds_issue(pr, owner, repo, issue_number):
+            return empty
+        if pr.get("merged") is not True:
             return json.dumps({"payout_address": "", "verdict": "NOT_FIXED"}, separators=(",", ":"))
-        match = PAYOUT_LINE_RE.search(pr_text)
+        body = str(pr.get("body") or "")
+        match = PAYOUT_LINE_RE.search(body)
         if not match:
-            return json.dumps({"payout_address": "", "verdict": "VOID"}, separators=(",", ":"))
-        payout_address = match.group(1)
-        issue_text = _fetch(issue_url)
+            return empty
+        files = _fetch(
+            "https://api.github.com/repos/" + owner + "/" + repo + "/pulls/" + pr_number + "/files"
+        )
         prompt = (
             "You are judging whether a merged pull request fixes a reported issue. "
-            "The merge is already confirmed. Reply with exactly one word: FIXED or NOT_FIXED.\n\n"
-            "Issue page:\n" + (issue_text if issue_text else "(issue page could not be fetched)")
-            + "\n\nPull request page:\n" + pr_text
+            "The merge is already confirmed from GitHub's pull request record. "
+            "Reply with exactly one word: FIXED or NOT_FIXED.\n\n"
+            "Issue record:\n" + json.dumps({
+                "title": issue.get("title", ""),
+                "body": str(issue.get("body") or "")[:MAX_PAGE_CHARS],
+            })
+            + "\n\nPull request record:\n" + json.dumps({
+                "title": pr.get("title", ""),
+                "body": body[:MAX_PAGE_CHARS],
+            })
+            + "\n\nChanged files:\n" + (files if files else "(files could not be fetched)")
         )
         raw = str(gl.nondet.exec_prompt(prompt)).strip().upper()
         verdict = "FIXED" if raw.startswith("FIXED") else "NOT_FIXED"
         return json.dumps(
-            {"payout_address": payout_address, "verdict": verdict},
+            {"payout_address": match.group(1), "verdict": verdict},
             separators=(",", ":"),
         )
 
@@ -170,11 +224,15 @@ class BountyVault(gl.Contract):
             "bounty_id": "",
             "creator": "",
             "issue_url": "",
+            "owner": "",
+            "repo": "",
+            "issue_number": "",
             "reward_amount": 0,
             "status": "open",
             "deadline_at": 0,
             "created_at": "",
             "submitted_pr_url": "",
+            "pr_number": "",
             "submitted_by": "",
             "submitted_at": "",
             "last_verdict": "",
@@ -187,9 +245,7 @@ class BountyVault(gl.Contract):
 
     @gl.public.write.payable
     def create_bounty(self, issue_url: str, deadline_minutes: int) -> str:
-        issue_url = issue_url.strip()
-        if not issue_url.startswith("https://"):
-            _fail("issue_url must be https")
+        owner, repo, issue_number = _parse_issue(issue_url)
         if deadline_minutes < MIN_DEADLINE_MINUTES or deadline_minutes > MAX_DEADLINE_MINUTES:
             _fail("deadline_minutes must be between 60 and 129600")
         reward = _msg_value()
@@ -205,7 +261,10 @@ class BountyVault(gl.Contract):
         row = self._empty()
         row["bounty_id"] = bounty_id
         row["creator"] = _who()
-        row["issue_url"] = issue_url
+        row["issue_url"] = "https://github.com/" + owner + "/" + repo + "/issues/" + issue_number
+        row["owner"] = owner
+        row["repo"] = repo
+        row["issue_number"] = issue_number
         row["reward_amount"] = reward
         row["deadline_at"] = _epoch(created) + deadline_minutes * 60
         row["created_at"] = created
@@ -224,10 +283,11 @@ class BountyVault(gl.Contract):
             _fail("bounty is not open")
         if _epoch(_now()) >= int(row["deadline_at"]):
             _fail("bounty deadline has passed, call reclaim_expired instead")
-        pr_url = pr_url.strip()
-        if not pr_url.startswith("https://"):
-            _fail("pr_url must be https")
-        row["submitted_pr_url"] = pr_url
+        owner, repo, pr_number = _parse_pr(pr_url)
+        if not _same(owner, row["owner"]) or not _same(repo, row["repo"]):
+            _fail("pull request must belong to the bounty repository")
+        row["submitted_pr_url"] = "https://github.com/" + owner + "/" + repo + "/pull/" + pr_number
+        row["pr_number"] = pr_number
         row["submitted_by"] = _who()
         row["submitted_at"] = _now()
         row["last_verdict"] = ""
@@ -242,12 +302,12 @@ class BountyVault(gl.Contract):
             _fail("unknown bounty_id")
         if row["status"] != "open":
             _fail("bounty is not open")
-        if row["submitted_pr_url"] == "":
+        if row["submitted_pr_url"] == "" or row["pr_number"] == "":
             _fail("no candidate PR has been submitted yet")
         if _epoch(_now()) >= int(row["deadline_at"]):
             _fail("bounty deadline has passed, call reclaim_expired instead")
 
-        packed = json.loads(_judge(row["issue_url"], row["submitted_pr_url"]))
+        packed = json.loads(_judge(row["owner"], row["repo"], row["issue_number"], row["pr_number"]))
         verdict = str(packed.get("verdict", "VOID"))
         if verdict not in ("FIXED", "NOT_FIXED", "VOID"):
             verdict = "VOID"
